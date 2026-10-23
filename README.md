@@ -1,4 +1,4 @@
-# Unity XLua+Addressable 热更新系统
+# Unity XLua+Addressables 热更新系统
 
 > 资源走 Addressables，代码走 xLua，自建 `manifest.json` 作为唯一版本真相。
 > 平台：Android / iOS / PC（Unity 2022.3.48f1c1）
