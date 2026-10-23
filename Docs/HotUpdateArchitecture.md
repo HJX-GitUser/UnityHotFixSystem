@@ -69,12 +69,13 @@ graph TD
 
     subgraph L1["L1 热更核心服务（C#，随包，接口冻结）"]
         Orch["UpdateOrchestrator<br/>流程状态机"]
-        Ver["VersionService<br/>清单获取与决策"]
-        Dld["DownloadService<br/>队列 / 续传 / 重试"]
-        Vfy["VerifyService<br/>大小 / Hash"]
-        Stg["StorageService<br/>路径 / 配额 / 原子写"]
-        Rbk["RollbackService<br/>快照 / 回退"]
-        Rep["LogReporter<br/>阶段上报"]
+        Ver["ManifestService<br/>清单获取与决策"]
+        Dld["DownloadService<br/>续传 / 重试 / 超时"]
+        Vfy["VerifyService<br/>大小 / SHA256"]
+        Stg["StorageService<br/>路径 / 原子写"]
+        Qta["StorageQuotaService<br/>空间预检 / 旧版本清理"]
+        Rbk["RollbackService<br/>双清单 / 回退"]
+        Rep["HotfixReporter<br/>阶段上报"]
     end
 
     subgraph L2["L2 内容通道适配（C#）"]
@@ -93,6 +94,7 @@ graph TD
     Orch --> AA
     Orch --> Lpkg
     Orch --> Rbk
+    Orch --> Qta
     AA --> Dld
     AA --> Vfy
     Lpkg --> Dld
@@ -101,6 +103,7 @@ graph TD
     Vfy --> Stg
     Ver --> Stg
     Rbk --> Stg
+    Qta --> Stg
     Orch -.-> Rep
     AA --> Res
     Lpkg --> LuaCode
@@ -120,23 +123,29 @@ graph TD
 
 | 模块 | 层 | 职责 | 明确不做 | 失败时行为 |
 |---|---|---|---|---|
-| **BootLoader** | L0 | 最早执行：环境自检（网络/磁盘/权限）、初始化路径、拉起 Orchestrator、渲染更新 UI、最后跳转游戏 | 不解析版本、不下载 | 弹错误页，提供"重试 / 退出" |
-| **VersionService** | L1 | 拉取远端 manifest、与本地比对、产出"更新计划"（要不要更、更什么、多大） | 不下载、不落盘业务文件 | 远端失败 → 用本地清单继续启动（离线可玩） |
-| **DownloadService** | L1 | 通用下载队列：并发控制、Range 续传、超时、指数退避重试、进度聚合 | 不知道内容语义（资源还是脚本） | 单任务重试 N 次后失败 → 整轮更新失败，旧版本继续可用 |
-| **VerifyService** | L1 | 大小比对 → Hash 比对 → 签名（可选） | 不做修复，只判定 | 校验失败 → 删除该临时文件并重下一次 |
-| **StorageService** | L1 | 路径约定、版本化目录、原子写入（临时文件 + rename）、磁盘配额检查与清理 | 不关心文件内容 | 空间不足 → 提前拦截并提示，不进入下载 |
-| **RollbackService** | L1 | 维护 current / prev 双清单、事务状态、启动健康哨兵、执行回退 | 不负责重新下载 | 回退本身失败 → 走"内置版本"兜底 |
-| **UpdateOrchestrator** | L1 | 流程状态机：串起上面所有模块，对外只暴露"启动更新"和"进度事件" | 不实现具体下载/校验逻辑 | 任一阶段异常 → 中断 → 回滚 |
-| **AddressablesAdapter** | L2 | 加载远端 catalog、计算下载量、触发下载、对外提供资源加载入口 | 不决定"要不要更新" | 抛给 Orchestrator 统一处理 |
-| **LuaPackageAdapter** | L2 | 取 Lua 包 → 落盘到版本目录 → 校验 → 通知 XLuaManager 换根目录 | 不解析 Lua 语义 | 同上 |
-| **LogReporter** | L1 | 记录每阶段的版本、耗时、错误码，异步上报 | 不阻塞主流程 | 静默失败，不得影响启动 |
+| **BootLoader** | L0 | 启动器：关闭 XLuaManager 自动创建、拉起 Orchestrator、渲染更新 UI、更新结束后创建 XLuaManager 并加载主场景 | 不解析版本、不下载、不做空间/网络判断 | 弹错误页，提供"重试" |
+| **HotfixPaths** | L1 | 运行时目录的唯一出处（根目录、清单、状态、`lua/v<版本>`、tmp） | 不做任何 IO | — |
+| **ManifestService** | L1 | 读本地 / 内置清单、拉远端清单（ETag + 重试退避）、比对并产出 `UpdatePlan` | 不下载、不落盘业务文件 | 远端失败 → 用本地清单继续启动（离线可玩） |
+| **DownloadService** | L1 | 单文件下载：Range 续传、超时、指数退避重试；识别服务器忽略 Range 并整包重下 | 不知道内容语义，也不做并发队列（当前只有 Lua 包一个任务） | 重试耗尽 → 整轮更新失败，旧版本继续可用 |
+| **VerifyService** | L1 | 大小比对 → SHA256 比对（按块读，不卡主线程） | 不做修复，只判定 | 校验失败 → 丢弃临时文件并重下一次 |
+| **StorageService** | L1 | 路径约定、原子写入（临时文件 + rename）、读取包内文件 | 不判断配额、不关心文件内容 | IO 失败 → 抛给上层，回滚保护旧版本 |
+| **StorageQuotaService** | L1 | 空间预检（预留 32MB）、旧版本清理（保留当前 + 上一版） | 不负责下载 | 空间不足 → 下载前拦截并提示 |
+| **RollbackService** | L1 | 维护 current / prev 双清单、`state.json` 事务状态、`healthy.flag` 健康哨兵、坏版本标记 | 不负责重新下载 | 回退本身失败 → 走"内置版本"兜底 |
+| **UpdateOrchestrator** | L1 | 流程状态机：串起上面所有模块，对外只暴露 `Run(onProgress, onDone)` | 不实现具体下载/校验逻辑 | 任一阶段异常 → 中断 → 回滚 |
+| **AddressablesAdapter** | L2 | 加载远端 catalog、按 label 计算下载量、触发下载、清理缓存 | 不决定"要不要更新" | 抛给 Orchestrator 统一处理 |
+| **LuaPackageAdapter** | L2 | 取 Lua 包 → 校验 → 落盘到版本目录 → 激活并通知 XLuaManager 换根目录 | 不解析 Lua 语义 | 同上 |
+| **HotfixReporter** | L1 | 记录每阶段的版本、耗时、错误码；默认实现只打日志 | 不阻塞主流程 | 静默失败，不得影响启动 |
+| **UpdateProgress / UpdateResult / UpdatePlan** | L1 | 跨模块传递的纯数据：阶段 + 进度、结果 + 错误码、更新计划 | 不含行为 | — |
+
+> 命名对照：早期设计稿里的 `VersionService` / `LogReporter` 已分别落地为 `ManifestService` / `HotfixReporter`；`StorageService` 原有的配额职责已拆到独立的 `StorageQuotaService`。
 
 ### 3.2 模块边界速查
 
-- **"要不要更新"只由 VersionService 回答**。任何其他模块不得自己拉清单、自己比版本。
+- **"要不要更新"只由 ManifestService 回答**。任何其他模块不得自己拉清单、自己比版本。
 - **"文件怎么写"只由 StorageService 回答**。任何其他模块不得拼 `Application.persistentDataPath`。
 - **"怎么下载"只由 DownloadService 回答**。适配层不得自己开 `UnityWebRequest`（Addressables 内部下载除外，那是它的封装）。
 - **"现在到哪一步了"只由 Orchestrator 回答**。UI 只订阅它的事件，不反向驱动流程。
+- **"空间够不够"只由 StorageQuotaService 回答**。下载前统一走 `HasRoomFor()`，不要在业务里自己算可用空间。
 
 ---
 
@@ -148,11 +157,12 @@ graph TD
 graph LR
     Boot["BootLoader / UI"] --> Orch["UpdateOrchestrator"]
 
-    Orch --> Ver["VersionService"]
+    Orch --> Ver["ManifestService"]
     Orch --> Rbk["RollbackService"]
     Orch --> AA["AddressablesAdapter"]
     Orch --> Lpkg["LuaPackageAdapter"]
-    Orch --> Rep["LogReporter"]
+    Orch --> Qta["StorageQuotaService"]
+    Orch --> Rep["HotfixReporter"]
 
     AA --> Dld["DownloadService"]
     AA --> Vfy["VerifyService"]
@@ -164,6 +174,7 @@ graph LR
     Ver --> Stg
     Rbk --> Stg
     Rbk --> Ver
+    Qta --> Stg
 
     AA -.-> EXT1["Addressables 运行时"]
     Lpkg -.-> EXT2["XLuaManager / ILuaScriptProvider"]
@@ -174,9 +185,9 @@ graph LR
 | 规则 | 说明 |
 |---|---|
 | R1 | 依赖只允许**从上层指向下层**：L0 → L1 → L2 → L3，禁止反向 |
-| R2 | L1 各服务之间**只允许极少数依赖**：`Download/Verify/Version/Rollback → Storage`，`Rollback → Version`，其余互不引用 |
+| R2 | L1 各服务之间**只允许极少数依赖**：`Download/Verify/Manifest/Rollback/Quota → Storage`，`Rollback → Manifest`，其余互不引用 |
 | R3 | **L2 不得引用 Orchestrator**。适配层是被调用的，不是调用方 |
-| R4 | **L1 不得引用具体适配器实现**，只引用接口（便于换实现、便于测试） |
+| R4 | **L1 不得引用具体适配器实现**，只引用接口（便于换实现、便于测试）。**现状未落地**：`UpdateOrchestrator` 仍直接 `new AddressablesAdapter()` / `new LuaPackageAdapter()`，抽接口列在 §12.5 |
 | R5 | **L3 业务代码只能通过门面访问系统能力**，禁止直接调 DownloadService / Addressables |
 | R6 | 所有跨模块通信走**显式事件或返回值**，不允许静态全局状态互相读 |
 | R7 | 模块之间传递的数据只允许是**纯数据结构**（清单、计划、进度、错误），不传 `UnityWebRequest`、`AssetBundle` 之类的运行时对象（L2 内部除外） |
@@ -238,11 +249,11 @@ xLua **不是万能的代码热更**，边界如下：
 
 ### 6.1 三级版本
 
-| 版本 | 谁产生 | 作用 |
-|---|---|---|
-| **AppVersion** | 玩家安装包（商店） | 决定能兼容哪些 manifest；不兼容 → 引导去商店 |
-| **ResourceVersion** | 每次构建 Addressables 产出 | 标识一套 catalog + bundle 集合 |
-| **ScriptVersion** | 每次构建 Lua 包产出 | 标识一个 Lua 包 |
+| 版本 | 谁产生 | 作用 | 清单字段 |
+|---|---|---|---|
+| **AppVersion** | 玩家安装包（商店） | 决定能兼容哪些 manifest；不兼容 → 引导去商店 | `appVersionRange` 与之比对 |
+| **ResourceVersion** | 每次构建 Addressables 产出 | 标识一套 catalog + bundle 集合 | `resources.catalogHash` + `resources.groups[].version` |
+| **ScriptVersion** | 每次构建 Lua 包产出 | 标识一个 Lua 包，同时是磁盘目录名 | `scripts.version`（构建工具按 `"1.0." + contentVersion` 生成） |
 
 外加一个**单调递增的 `contentVersion`（整数）**，作为"是否有更新"的唯一比较依据。
 不要用时间戳、不要用语义化版本比较大小 —— 整数最不容易出错。
@@ -251,21 +262,24 @@ xLua **不是万能的代码热更**，边界如下：
 
 ```text
 manifest
-├─ manifestVersion          清单格式版本（用于将来兼容老客户端）
+├─ manifestVersion          清单格式版本（当前为 1；高于客户端 CurrentManifestVersion 直接判为不兼容）
 ├─ contentVersion           整数，单调递增；客户端的"是否要更新"只看它
-├─ appVersionRange          兼容区间 { min, max }；越界则强制走商店
+├─ appVersionRange          兼容区间 { min, max }；越界则强制走商店（留空 = 不限制）
 ├─ resources
 │   ├─ catalogUrl           远端 catalog 地址
 │   ├─ catalogHash          用于判断 catalog 是否变化
-│   └─ groups[]             { name, version, size, hash }（用于分模块按需下载）
+│   └─ groups[]             { name, version, size, hash }（size 仅为占位，真实下载量运行期现算）
 ├─ scripts
+│   ├─ version              Lua 包版本，形如 "1.0.3"，同时就是磁盘目录名 lua/v1.0.3
 │   ├─ packageUrl           Lua 包地址
-│   ├─ packageHash          包级 Hash
+│   ├─ packageHash          包级 SHA256
 │   ├─ size                 用于提前判断流量/磁盘
 │   └─ entryModule          入口模块名（默认 "Main"，替换 XLuaManager 的硬编码）
-├─ channel                  灰度/渠道标记
-└─ createdAt                发布时刻（仅用于排查，不参与比较）
+├─ channel                  渠道标记；与客户端 channel 不一致则本次不更新
+└─ createdAtUnix            发布时刻（Unix 秒，仅用于排查，不参与比较）
 ```
+
+**必填校验**（`HotfixManifest.TryValidate`）：`manifestVersion` 不得高于客户端支持的版本；`scripts.version` / `packageUrl` / `packageHash` 不能为空，`scripts.size` 必须 > 0；`entryModule` 为空时自动补 `Main`。清单文本会先经 `SanitizeJsonText` 去掉 BOM 与首尾空白，避免 CDN 带 BOM 时 `JsonUtility` 直接失败。
 
 ### 6.3 清单的存放与获取
 
@@ -274,9 +288,15 @@ manifest
 | 包内 `StreamingAssets/hotfix/manifest.json` | 出厂基线，**离线可用**、**回滚兜底** |
 | 本地 `persistentDataPath/hotfix/manifest.json` | 当前生效版本 |
 | 本地 `persistentDataPath/hotfix/manifest.prev.json` | 上一版，用于回滚 |
+| 本地 `persistentDataPath/hotfix/manifest.etag` | 上次远端清单的 ETag，下次带 `If-None-Match` |
 | 远端 CDN | 最新版本 |
 
-**获取策略**：先请求远端（带 `If-None-Match` / ETag）；网络失败或超时 → 直接用本地清单启动游戏，后台静默重试。**永远不要因为"检查不到更新"而卡住玩家**。
+**获取策略**：
+
+1. 启动先读本地清单，没有就回落内置清单——保证"一定能进游戏"，这一步不等网络；
+2. 再请求远端（带 `If-None-Match` / ETag，`304 Not Modified` 视为无变化）；
+3. 远端失败或超时 → 直接沿用本地清单，绝不卡住玩家；
+4. 拉取带重试与退避，成功后把 ETag 原子写到 `manifest.etag`。
 
 ---
 
@@ -317,12 +337,13 @@ HotFixProject/
 │  │  └─ HotfixBuildSettings.asset   # 构建期配置（首次构建自动生成）
 │  ├─ AddressableAssetsData/         # Addressables 配置；远端组由构建工具自动创建
 │  ├─ StreamingAssets/
-│  │  └─ hotfix/
-│  │     ├─ manifest.json            # 出厂基线清单
-│  │     └─ lua.bundle               # 出厂 Lua 包（兜底用）
+│  │  ├─ hotfix/
+│  │  │  ├─ manifest.json            # 出厂基线清单
+│  │  │  └─ lua.bundle               # 出厂 Lua 包（兜底用）
+│  │  └─ Lua/                        # XLua 编辑器工具（Tools/XLua）的默认转换输出
 │  └─ XLua/                          # 第三方，不改动
 ├─ Lua/                              # Lua 源码（独立管理，便于 IDE 提示与代码审查）
-│  ├─ Main.lua
+│  ├─ Main.lua                       # 当前仓库只带示例入口，core/modules/config 按需建
 │  ├─ core/                          # 框架层（事件、UI 栈、资源封装、日志）
 │  ├─ modules/                       # 业务模块
 │  └─ config/
@@ -339,6 +360,7 @@ HotFixProject/
 - `Lua/` 放在**工程根目录而非 Assets 下**：不参与 Unity 资产导入，改脚本不会触发重编译/重导入，迭代快；由构建工具转成 `.lua.txt` 后再进 Assets。
 - `Hotfix/Bootstrap/` 与 `Hotfix/` 其余目录的区别是**生命周期**，不是功能。任何"下周可能要改"的代码都不许放进 Bootstrap。
 - `Settings/` 与 `ServerData/` 都是**生成物**：前者首次构建时创建，后者每次构建覆盖，不需要手工维护。
+- **两套 Lua→Text 输出别混**：Hotfix 构建写 `Assets/ArtAssets/Lua/`（`HotfixBuildSettings.luaAssetFolder`，用于打 Lua 包）；`Tools/XLua` 的转换工具默认写 `Assets/StreamingAssets/Lua/`（供 `XLuaManager` 直接读）。两者互不影响，按使用场景选。
 - 文档跟着代码走：`README.md` 与 `Docs/` 都放在 `Assets/Scripts/Hotfix/` 下（工程根已无 `Docs/` 目录），文档之间的引用按这个相对位置写；模块整体搬迁时文档随目录一起移动即可。
 - `XLuaMgr/`（运行时）与 `Editor/XLuaMgr/`（工具）已并入 `Hotfix/`：前者仍是 Lua 运行时能力，后者是仅编辑器脚本，全工程的编辑器代码集中在 `Hotfix/Editor/` 一个目录下，按归属分子目录。
 
@@ -349,14 +371,15 @@ persistentDataPath/
 ├─ hotfix/
 │  ├─ manifest.json              # 当前生效
 │  ├─ manifest.prev.json         # 上一版（回滚用）
+│  ├─ manifest.etag              # 远端清单 ETag 缓存
 │  ├─ state.json                 # 事务状态：idle / downloading / verifying / committed
-│  ├─ healthy.flag               # 健康哨兵：写完代表本次启动成功
+│  ├─ healthy.flag               # 健康哨兵：内容为 contentVersion，写完代表本次启动成功
 │  ├─ lua/
 │  │  ├─ v1.0.3/
 │  │  │  └─ lua.bundle
 │  │  ├─ v1.0.4/
 │  │  │  └─ lua.bundle
-│  │  └─ current.txt             # 内容就是一行版本号，例："v1.0.4"
+│  │  └─ current.txt             # 内容就是一行版本号，例："1.0.4"（不带 v）
 │  └─ tmp/                       # 下载临时区，启动时清空
 └─ com.unity.addressables/       # Addressables 自己管，不要手删
 ```
@@ -377,68 +400,84 @@ Android/iOS 对符号链接支持不一致，所以指针用**普通文本文件
 sequenceDiagram
     autonumber
     participant B as BootLoader
-    participant O as Orchestrator
+    participant O as UpdateOrchestrator
     participant S as StorageService
-    participant V as VersionService
-    participant D as DownloadService
+    participant M as ManifestService
+    participant Q as StorageQuotaService
     participant F as VerifyService
     participant A as AddressablesAdapter
     participant P as LuaPackageAdapter
     participant X as XLuaManager
 
-    B->>O: Start()
-    O->>S: 初始化路径 / 清理 tmp
-    O->>S: 读本地 manifest + state.json
-    alt state 不是 idle/committed（上次更新被打断）
-        O->>O: Rollback → 使用 prev 清单
+    B->>O: Run(onProgress, onDone)
+    O->>S: EnsureDirectories / CleanTemp
+    O->>O: 读 state.json；中间态 → 回退 prev 并同步 Lua 指针
+    O->>M: LoadApplied（本地 → 内置）
+    M-->>O: 当前生效清单
+    opt 本地没有任何可用版本
+        O->>P: EnsureBundledBaseline（释放 StreamingAssets 出厂包）
     end
-    O->>V: FetchRemote(manifest)
-    V-->>O: 远端清单 或 "无网/超时"
-    O->>V: Decide(local, remote, appVersion, channel)
-    V-->>O: 更新计划（是否需更新 / 资源清单 / 脚本 / 总大小）
-    alt 无更新
-        O->>O: 直接进入加载阶段
-    else 有更新
-        O->>O: 磁盘空间检查（不足则终止）
-        O->>O: 展示确认（大包 / 仅 Wi-Fi 策略）
-        O->>S: 写入 state=downloading
-        O->>A: UpdateCatalog(新 catalog)
-        O->>D: 下载资源（按 group 顺序）
-        O->>P: 下载 Lua 包 → tmp
-        D-->>O: 进度事件
-        O->>S: 写入 state=verifying
-        O->>F: 校验（大小 → Hash）
-        alt 校验失败
-            F-->>O: 失败（重下 N 次后仍失败）
-            O->>O: 中断，不提交，旧版本继续可用
-        else 校验通过
-            O->>S: 落盘：tmp → lua/v新版本/
-            O->>S: Commit：写 manifest、备份 prev、清 state
+    O->>O: phase=committed 且未确认健康 → bootAttempts+1（≥2 回退）
+    O->>M: FetchRemote（ETag / 重试退避 / 开发期可跳过）
+    M-->>O: 远端清单 或 null（超时/失败）
+    O->>M: BuildPlan
+    M-->>O: UpdatePlan（是否更、更什么、多大）
+    alt RequiresStoreUpdate
+        O-->>B: StoreUpdateRequired
+    else 无需更新
+        O-->>B: Completed（沿用当前版本）
+    else 需要更新
+        opt 资源通道开启
+            O->>A: LoadRemoteCatalog
+            O->>A: 逐 label GetDownloadSize
         end
+        O->>Q: HasRoomFor(下载量 + 当前版本占用)
+        opt 移动网络且超过 wifiOnlyThreshold
+            O-->>B: Completed（本次跳过，仍进游戏）
+        end
+        opt 超过 confirmThreshold
+            O-->>B: WaitingForConfirmation
+            B-->>O: 玩家确认/取消
+        end
+        opt 需要更新 Lua
+            O->>S: BeginTransaction(downloading)
+            O->>P: Download → tmp（Range 续传 / 退避重试）
+            O->>S: BeginTransaction(verifying)
+            O->>F: 大小 + SHA256
+            O->>P: Place → lua/v新版本/lua.bundle
+        end
+        opt 需要更新资源
+            O->>A: DownloadDependencies(label)
+        end
+        O->>P: Activate（写 current.txt）
+        O->>S: Commit（备份 prev、写 manifest、state=committed）
+        O->>Q: PruneLuaVersions（保留当前 + 上一版）
+        O-->>B: Completed（AppliedUpdate=true）
     end
-    O->>P: 激活 Lua 根目录（读 current.txt）
-    P->>X: 挂载新 provider / 重建 loader
-    O->>A: 预热必要资源（可选）
-    O->>B: 通知"可以进游戏了"
-    B->>O: 加载 Main 场景
-    O->>S: 写 healthy.flag
+    B->>X: 创建 XLuaManager（PendingLuaRoot + 自动挂载 lua.bundle）
+    X-->>B: RunMainModule() 成败
+    B->>S: MarkHealthy（写 healthy.flag，state 回 idle）
+    B->>B: 加载 mainSceneName
 ```
 
 ### 8.2 阶段表（含失败处理）
 
-| # | 阶段 | 关键动作 | 失败处理 | 能否卡住玩家 |
+| # | 阶段（`HotfixStage`） | 关键动作 | 失败处理 | 能否卡住玩家 |
 |---|---|---|---|---|
-| 0 | 环境自检 | 网络类型、磁盘余量、路径可写、权限 | 磁盘不足 → 提示清理，不进下载 | 是（磁盘满无法继续） |
-| 1 | 本地恢复 | 读 manifest + state；上次事务未提交 → 回滚 | 本地清单损坏 → 用 StreamingAssets 内置清单 | 否 |
-| 2 | 拉取清单 | 远端请求，ETag 缓存，3~5s 超时 | 超时/失败 → 用本地清单直接启动 | **否**（必须保证） |
-| 3 | 版本决策 | 比 contentVersion、查 appVersionRange、查灰度 | 需强更 → 引导商店；其余情况用本地版本 | 强更是 |
-| 4 | 空间预检 | 新内容大小 + 保留旧版本 × 2 | 不足 → 提示清理或降级为"仅更脚本" | 是 |
-| 5 | 下载 | 并发 3、Range 续传、单文件超时 30s、退避重试 3 次 | 超限 → 整轮失败，保留旧版本 | 否（可跳过继续玩） |
-| 6 | 校验 | 大小 → Hash；资源侧用 Addressables CRC | 单个失败重下；连续失败 → 终止本轮 | 否 |
-| 7 | 落盘 | tmp → 版本目录（同盘 rename） | 失败 → 清理 tmp，保留旧版本 | 否 |
-| 8 | 提交 | 写 manifest → 备份 prev → 清 state | 失败 → 下次启动按"未提交"回滚 | 否 |
-| 9 | 加载 | 激活 Lua 根目录，加载 catalog，进 Main | 加载异常 → 弹错误 + 上报，允许重试 | 是 |
-| 10 | 健康标记 | 进游戏后写 healthy.flag | 未写 → 下次启动自动回滚 | — |
+| 0 | `CheckingLocal` | 建目录、清 tmp、读 `state.json`；上次被打断 → 回退 prev 并同步指针；读本地 → 内置清单；无可用版本则释放出厂基线；`committed` 但未确认健康 → `bootAttempts+1`（≥2 回退） | 本地清单损坏 → 回退 prev → 内置 | 否 |
+| 1 | `FetchingManifest` | 远端清单：带 ETag、重试与退避；`skipRemoteCheckInDevBuild` 可跳过 | 超时/失败 → 用本地清单继续启动 | **否**（必须保证） |
+| 2 | `Deciding`（仅日志，未上报） | `BuildPlan`：比 `contentVersion`、查 `appVersionRange`、查 `channel`、跳过坏版本 | 需强更 → `StoreUpdateRequired` | 强更是 |
+| 3 | `DownloadingResources`（前半段） | 加载远端 catalog；逐 label `GetDownloadSizeAsync` 汇总待下载量 | catalog 失败 → `DownloadFailed`，旧版本继续可用 | 否 |
+| 4 | 配额（`Preparing`，未单独上报） | `HasRoomFor(下载量 + 当前版本占用)`，内部预留 32MB | 不足 → `InsufficientSpace`，未开始下载即失败 | 是（需清理空间） |
+| 5 | `WaitingForConfirmation` | 移动网络超 `wifiOnlyThresholdBytes` 直接跳过；超 `confirmThresholdBytes` 挂起等玩家确认 | 玩家取消 → 本次跳过，仍可进游戏 | 否 |
+| 6 | `Downloading` | Lua 包下到 tmp：Range 续传、超时 `timeoutSeconds`（默认 30s）、退避 `maxRetries`（默认 3 次）；服务器忽略 Range 自动整包重下 | 重试耗尽 → `DownloadFailed`，清 tmp | 否 |
+| 7 | `Verifying` | 大小 + SHA256（按块读，不卡主线程） | 失败 → `VerifyFailed`，不提交 | 否 |
+| 8 | `Installing` | tmp → `lua/v<版本>/lua.bundle`（同盘 rename） | 失败 → `InstallFailed`，旧版本保留 | 否 |
+| 9 | `DownloadingResources`（后半段） | 按 label `DownloadDependenciesAsync`；CRC 与缓存交给 Addressables | 失败 → `DownloadFailed`，新 Lua 目录留待下次覆盖 | 否 |
+| 10 | `Committing` | `Activate`（写 `current.txt`）→ `Commit`（备份 prev、写 manifest、state=committed）→ `PruneLuaVersions` | 异常 → `InstallFailed` + `Abort` | 否 |
+| 11 | `Completed` / `Failed` | 返回 `UpdateResult`（含 `LuaRootOverride`、`AppliedUpdate`） | — | — |
+
+> 枚举里的 `Idle` / `Deciding` / `Preparing` / `Loading` 目前不单独上报，进度上会归并到相邻阶段；UI 按 `HotfixStage` 出现与否做兼容，不要假定每个枚举值都会出现。
 
 ### 8.3 状态机（`state.json` 的 phase）
 
@@ -450,7 +489,7 @@ stateDiagram-v2
     Downloading --> Idle: 失败/取消（清理 tmp）
     Verifying --> Committed: 校验通过 + 落盘成功
     Verifying --> Idle: 校验失败（清理 tmp）
-    Committed --> Idle: 写入 healthy.flag 后
+    Committed --> Idle: BootLoader 在 Lua 入口成功后调用 MarkHealthy（写 healthy.flag）
     Committed --> Idle: 下次启动发现未 healthy → 回滚到 prev
 ```
 
@@ -464,8 +503,9 @@ stateDiagram-v2
 
 | 条件 | 处理 |
 |---|---|
-| 启动时 `state.phase` 是 `downloading` / `verifying` | 回退到 prev 清单 |
-| 连续 2 次启动未写入 `healthy.flag` | 回退到 prev 清单，并标记该版本"坏版本"，不再尝试下载 |
+| 启动时 `state.phase` 是 `downloading` / `verifying` | 回退到 prev 清单（回退时写入 `badContentVersion`） |
+| `state.phase=committed` 但连续 2 次启动未确认健康（`bootAttempts ≥ 2`） | 回退到 prev 清单，并把该版本标记为"坏版本"，不再尝试下载 |
+| 远端清单的目标版本等于 `badContentVersion` | 本次跳过更新（不下载），继续用当前版本 |
 | 玩家手动"修复客户端" | 回退到 prev → 仍失败 → 回退到 StreamingAssets 内置版本 |
 | manifest 解析失败 / 版本目录缺失 | 逐级降级：prev → 内置 |
 
@@ -527,7 +567,7 @@ stateDiagram-v2
 | 7 | **AddressablesAdapter：远端 catalog 接入** | 依赖 P0 的下载/校验地基，此时接入成本最低 |
 | 8 | **资源分组（local/remote）与按需下载** | 决定包体与流量体验，需要真实资源量级才能定 group 粒度 |
 | 9 | **磁盘配额与旧版本清理** | 有真实数据后再定策略，过早设计容易定错阈值 |
-| 10 | **LogReporter / 错误码体系** | 有线上数据后才有意义 |
+| 10 | **HotfixReporter / 错误码体系** | 有线上数据后才有意义 |
 | 11 | **强更 / 可选更 / 仅 Wi-Fi 策略** | 属于产品策略，可后置 |
 
 ### P2 —— 有明确需求再做
@@ -544,7 +584,7 @@ stateDiagram-v2
 
 ---
 
-## 12. 落地状态（P0 已实现）
+## 12. 落地状态（P0 + P1 已实现）
 
 ### 12.1 已实现的模块
 
@@ -555,13 +595,18 @@ stateDiagram-v2
 | 配置 | `Assets/Scripts/Hotfix/Core/HotfixConfig.cs` | 挂在 BootLoader 上，不写死在代码里 |
 | 事务状态 | `Assets/Scripts/Hotfix/Core/HotfixState.cs` | phase / bootAttempts / badContentVersion |
 | 清单模型 | `Assets/Scripts/Hotfix/Version/HotfixManifest.cs` | 含 BOM 清洗（CDN 常带 BOM，JsonUtility 会直接失败） |
-| 版本服务 | `Assets/Scripts/Hotfix/Version/ManifestService.cs` | 本地 → 内置 → 远端；清单拉取带重试与退避 |
+| 版本服务 | `Assets/Scripts/Hotfix/Version/ManifestService.cs` | 读本地 → 内置清单；远端清单带 ETag 缓存、重试与退避；产出 `UpdatePlan` |
 | 下载器 | `Assets/Scripts/Hotfix/Download/DownloadService.cs` | Range 续传、超时、指数退避；识别服务器忽略 Range 并自动重下 |
 | 校验 | `Assets/Scripts/Hotfix/Verify/VerifyService.cs` | 大小 + SHA256，按块读取不卡主线程 |
 | Lua 通道 | `Assets/Scripts/Hotfix/Adapters/LuaPackageAdapter.cs` | 下载 / 校验 / 落盘 / 激活四步分离，出厂基线释放 |
 | 回滚 | `Assets/Scripts/Hotfix/Rollback/RollbackService.cs` | 双清单、state.json、健康哨兵、坏版本标记 |
 | 编排 | `Assets/Scripts/Hotfix/Core/UpdateOrchestrator.cs` | 唯一流程入口，UI 只订阅进度 |
-| 引导 | `Assets/Scripts/Hotfix/Bootstrap/BootLoader.cs` | IMGUI 占位 UI；跑完更新才创建 XLuaManager |
+| 进度 / 结果 | `Assets/Scripts/Hotfix/Core/UpdateProgress.cs` | `HotfixStage` / `HotfixErrorCode` / `UpdateProgress` / `UpdateResult` 的定义处 |
+| 更新计划 | `Assets/Scripts/Hotfix/Version/UpdatePlan.cs` | 是否更资源 / 更脚本、label 列表、总字节、决策原因 |
+| 引导 | `Assets/Scripts/Hotfix/Bootstrap/BootLoader.cs` | IMGUI 占位 UI；跑完更新才创建 XLuaManager；Lua 入口成功后写 `healthy.flag` |
+| Lua 运行时 | `Assets/Scripts/Hotfix/XLuaMgr/XLuaManager.cs` | `LuaEnv` 生命周期、脚本定位、热重载、错误处理；本框架只加三个静态入口 |
+| Lua→Text 工具 | `Assets/Scripts/Hotfix/Editor/XLuaMgr/LuaToTextConverter.cs` | 构建工具复用；也提供 `Tools/XLua` 独立菜单 |
+| 示例脚本生成 | `Assets/Scripts/Hotfix/Editor/XLuaMgr/LuaSampleScriptCreator.cs` | 一键生成 `Lua/Main.lua` 入口模板 |
 | 构建工具 | `Assets/Scripts/Hotfix/Editor/Hotfix/HotfixBuildTools.cs` | Lua→Text 转换、打 bundle、算 Hash、生成清单、释放基线 |
 | 构建配置 | `Assets/Scripts/Hotfix/Editor/Hotfix/HotfixBuildSettings.cs` | 资产位于 `Assets/Settings/HotfixBuildSettings.asset` |
 | 资源通道（P1） | `Assets/Scripts/Hotfix/Adapters/AddressablesAdapter.cs` | 远端 catalog 加载、按 label 查询下载量、下载依赖、缓存清理 |
@@ -577,6 +622,7 @@ stateDiagram-v2
 | 场景 | 操作 |
 |---|---|
 | 首次接入 | 菜单 `Tools/Hotfix/1. Create Build Settings` 生成配置资产 |
+| 出包前 | 执行一次 `XLua/Generate Code`（生成代码随包，缺失时走反射且不支持委托） |
 | 发布热更 | 菜单 `Tools/Hotfix/2. Build Lua Package + Manifest`（会自动递增 contentVersion） |
 | 创建引导场景 | 菜单 `Tools/Hotfix/3. Create Boot Scene`（Boot 已创建并排在 Build Settings 第一位，其余场景自动补入） |
 | 命令行 | `Unity.exe -batchmode -quit -projectPath <工程> -executeMethod HotFix.HotUpdate.EditorTools.HotfixBuildTools.BuildFromCommandLine` |
@@ -623,6 +669,22 @@ stateDiagram-v2
 | 差量更新 | 需要真实包体规模数据后再评估 |
 | 正式 uGUI / UI Toolkit 界面 | 当前 IMGUI 仅占位，替换时只改 BootLoader，流程不动 |
 | 包体加密 / 多 CDN 调度 | 有明确诉求再立项 |
+| 适配器接口抽象 | `UpdateOrchestrator` 仍直接 `new` 具体适配器（R4 未落地）。出现第二种实现或要写单元测试时，再抽 `IResourceChannel` / `ILuaChannel` |
+| 清单签名 | 目前只做大小 + SHA256 的完整性校验，不防篡改；有安全诉求时加验签（Ed25519 / RSA） |
+
+### 12.6 对外接口与扩展点
+
+| 扩展点 | 入口 | 说明 |
+|---|---|---|
+| 启动更新 | `new UpdateOrchestrator(config).Run(onProgress, onDone)` | 唯一流程入口；`onProgress` 收 `UpdateProgress`，`onDone` 收 `UpdateResult` |
+| 大包确认 | `orchestrator.ConfirmDownloadRequest = (bytes, cb) => ...` | 返回协程，玩家选择后回调 `true / false`；不设置则跳过确认 |
+| 埋点上报 | `orchestrator.Reporter = new YourReporter()` | 实现 `IHotfixReporter`：`OnStage(stage, message)` + `OnFinished(result, stages)`；不得抛异常、不得阻塞 |
+| 配置 | `HotfixConfig`（挂在 `BootLoader` 上） | 清单地址、渠道、超时、重试、流量策略、阈值；默认值见 README「5. 配置项」 |
+| Lua 运行时接管 | `XLuaManager` 三个静态入口 + `SetLuaRootOverride()` | 见 §12.1 末尾；原有加载逻辑不变 |
+| 替换资源通道 | `Adapters/AddressablesAdapter.cs` | 换自研 bundle 系统时只改这一个类（接口抽象见 §12.5） |
+| 替换引导 UI | `Bootstrap/BootLoader.cs` | IMGUI 只是占位；UI 只读 `UpdateProgress`，不反向驱动流程 |
+
+`HotfixStage` 与 `HotfixErrorCode` 的完整取值、症状排查表见 [../README.md](../README.md)「8. 排查」。
 
 
 ---
@@ -657,7 +719,7 @@ stateDiagram-v2
 | Lua 包格式 | **AssetBundle**（复用现有 `AssetBundleLuaProvider`，零新代码） | 若将来需要明文可视/差分再评估 zip |
 | 大包确认阈值 | 超过 50MB 弹确认，超过 200MB 强制 Wi-Fi | 产品策略，可配 |
 | 强更判定 | 只由 `appVersionRange` 判定，不做"服务端强制" | 规则越少越不容易误杀 |
-| 开发期是否跳过更新流程 | Debug 模式下默认跳过，可手动开启 | 影响日常迭代效率 |
+| 开发期是否跳过更新流程 | 默认**不跳过**（`skipRemoteCheckInDevBuild=false`），需要时在 Inspector 打开 | 影响日常迭代效率 |
 
 ---
 
@@ -673,6 +735,9 @@ stateDiagram-v2
 | **提交（Commit）** | 把新版本从"已下载"变为"生效"的原子动作 |
 | **健康哨兵** | 启动成功后才写的标记文件，用于判定是否需要自动回滚 |
 | **中间态** | `downloading` / `verifying`，启动时遇到即视为异常退出 |
+| **UpdatePlan** | 版本决策产物：是否更、更资源还是脚本、待下载字节、决策原因 |
+| **UpdateResult** | 流程结果：成败、错误码、生效清单、Lua 根目录、是否真正应用了更新 |
+| **坏版本标记** | `state.badContentVersion`，命中的版本后续不再下载 |
 
 ## 附录 B：发布 Checklist
 

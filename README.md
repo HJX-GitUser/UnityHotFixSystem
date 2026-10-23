@@ -31,6 +31,16 @@
 | 体验与成本 | 默认仅 WiFi 下载、超阈值二次确认、阶段进度与耗时上报（`IHotfixReporter`） |
 | 低侵入接入 | 业务 UI 只订阅 `UpdateProgress`；对既有 `XLuaManager` 的改动只有三个静态入口 + 运行时换根目录 |
 
+### 运行时底座：XLuaManager
+
+双通道里的「代码通道」由同目录的 [XLuaMgr](./XLuaMgr/README.md) 承接：`XLuaManager` 是单例管理器，统一管 `LuaEnv` 生命周期、脚本定位与 C# ↔ Lua 调用，业务侧只写 Lua 就够了。
+
+- **脚本定位**：Debug 模式优先读工程根 `Lua/`，Release 优先 AssetBundle 与 `persistentDataPath`；`require("Main")`、`DoFile("Main.lua")`、`.lua.txt` 都能直接命中，报错显示真实文件与行号。
+- **生命周期驱动**：Lua 侧 `RegisterUpdate / LateUpdate / FixedUpdate` 即可，不必再写 `MonoBehaviour`。
+- **热重载**：`Reload(module)` 单模块重载，`RunMainModule()` 重跑入口，改脚本不用重启游戏。
+- **错误处理**：`LuaErrorInfo` 汇总 Lua traceback 与 C# 堆栈，可挂 `RegisterLuaErrorHandler` 统一上报。
+- **与热更框架的接缝极小**：只有三个静态入口加一个 `SetLuaRootOverride()`，热更包落盘后自动挂载，原有加载逻辑原样复用。
+
 ### 已经验证过的
 
 Unity 2022.3.48f1c1 实机编译 0 error；用本地 HTTP 充当 CDN 跑通「全新安装 → 下载 → 校验 → 落盘 → 激活」（contentVersion 1 → 2）；注入 `state.phase=downloading` 模拟更新中被杀，重启后自动回退基线并重新更新成功；Addressables 远端 catalog 加载、按 label 现算下载量均通过。联调期间修掉的 6 个真实缺陷（JSON BOM 解析、回退基线空引用、清单拉取缺重试、`AssetDatabase.Refresh` 后失效的 ScriptableObject 引用、`OutputPath` 指向 settings.json、catalog 未搬进上传目录）都已回归。
